@@ -774,38 +774,86 @@ def fit_class_conditional_mahalanobis(cache, n_host, hosts,
                 patch_counts=patch_counts, seq_counts=seq_counts)
 
 
-def _l2norm(X):
+# Working dtype for the Mahalanobis distance computation. float32 halves the
+# BLAS cost and memory traffic; the distances feed an interpolated quantile
+# CDF whose resolution is far coarser than float32 precision. Set to
+# ``np.float64`` to reproduce the original numerics exactly.
+MAHA_DTYPE = np.float32
+
+
+def _l2norm(X, dtype=np.float64):
     """Row-wise L2 normalization to the unit sphere (zero-safe)."""
-    X = np.asarray(X, dtype=np.float64)
+    X = np.asarray(X, dtype=dtype)
     return X / np.clip(np.linalg.norm(X, axis=1, keepdims=True), 1e-12, None)
 
 
-def _min_maha_np(X, means, cholL, normalize=False):
-    """Per-row min-over-genus Mahalanobis distance (numpy).
+class _MinMahalanobis:
+    """Precomputed min-over-genus Mahalanobis distance.
 
     ``dist_k^2 = || (x - mu_k) @ L ||^2`` with ``L = cholesky(precision)``.
-    ``X`` (n, D), ``means`` (Kv, D), ``cholL`` (D, D) -> (n,) distances.
-    When ``normalize`` is set, query rows are L2-normalized first (the means
-    were fit on normalized vectors), turning this into a whitened distance on
-    the unit sphere — directional rather than magnitude-sensitive.
+
+    The whitened means ``Mw = means @ cholL`` and their squared norms depend
+    only on the fitted model, so they are computed once here rather than on
+    every query. With (Kv, D) = (1064, 300) that projection is ~96M
+    multiply-adds — for a typical sequence it dominated the query-dependent
+    work by an order of magnitude, and for a single-row query (the aggregator
+    embedding) it was essentially the entire cost.
     """
-    X = np.asarray(X, dtype=np.float64)
-    if normalize:
-        X = _l2norm(X)
-    Xw = X @ cholL                                   # (n, D)
-    Mw = means @ cholL                               # (Kv, D)
-    d2 = ((Xw * Xw).sum(1)[:, None]
-          - 2.0 * Xw @ Mw.T + (Mw * Mw).sum(1)[None, :])
-    return np.sqrt(np.clip(d2.min(1), 0.0, None))
+
+    __slots__ = ('cholL', 'Mw_T', 'Mw_sq', 'normalize', 'dtype')
+
+    def __init__(self, means, cholL, normalize=False, dtype=MAHA_DTYPE):
+        self.dtype = dtype
+        self.normalize = bool(normalize)
+        self.cholL = np.ascontiguousarray(cholL, dtype=dtype)
+        Mw = np.asarray(means, dtype=dtype) @ self.cholL          # (Kv, D)
+        # store transposed so the query matmul hits a contiguous operand
+        self.Mw_T = np.ascontiguousarray(Mw.T)                    # (D, Kv)
+        self.Mw_sq = (Mw * Mw).sum(1)[None, :]                    # (1, Kv)
+
+    def distances(self, X):
+        """``X`` (n, D) -> (n,) min-over-genus distances."""
+        X = np.asarray(X, dtype=self.dtype)
+        if X.ndim == 1:
+            X = X[None, :]
+        if self.normalize:
+            X = _l2norm(X, dtype=self.dtype)
+        Xw = X @ self.cholL                                       # (n, D)
+        d2 = ((Xw * Xw).sum(1)[:, None] - 2.0 * (Xw @ self.Mw_T)) + self.Mw_sq
+        return np.sqrt(np.clip(d2.min(1), 0.0, None))
+
+    def distances_split(self, blocks):
+        """Distances for a list of (n_i, D) blocks, as one matmul.
+
+        Returns a list of (n_i,) arrays in input order. Concatenating the
+        blocks amortises BLAS call overhead across the batch; the arithmetic
+        is identical to calling ``distances`` on each block.
+        """
+        blocks = [np.asarray(b, dtype=self.dtype) for b in blocks]
+        blocks = [b[None, :] if b.ndim == 1 else b for b in blocks]
+        if not blocks:
+            return []
+        offs = np.cumsum([0] + [b.shape[0] for b in blocks])
+        d = self.distances(np.concatenate(blocks, axis=0))
+        return [d[offs[i]:offs[i + 1]] for i in range(len(blocks))]
 
 
-def _per_patch_distances(cache, means, cholL, normalize=False):
+def _min_maha_np(X, means, cholL, normalize=False, dtype=MAHA_DTYPE):
+    """Per-row min-over-genus Mahalanobis distance (numpy).
+
+    Thin wrapper kept for one-shot callers. When scoring more than one query
+    against the same ``means``/``cholL``, build a :class:`_MinMahalanobis`
+    once and reuse it instead — this wrapper pays the whitening cost per call.
+    """
+    return _MinMahalanobis(means, cholL, normalize=normalize,
+                           dtype=dtype).distances(X)
+
+
+def _per_patch_distances(cache, means, cholL, normalize=False,
+                         dtype=MAHA_DTYPE):
     """List (per sequence, in cache order) of per-patch min-genus distances."""
-    means = means.astype(np.float64)
-    cholL = cholL.astype(np.float64)
-    return [_min_maha_np(item['emb'].astype(np.float64), means, cholL,
-                         normalize=normalize)
-            for item in cache]
+    maha = _MinMahalanobis(means, cholL, normalize=normalize, dtype=dtype)
+    return [maha.distances(item['emb']) for item in cache]
 
 
 class ReliabilityScorer:
@@ -837,6 +885,15 @@ class ReliabilityScorer:
         self.Fa_values = np.asarray(aq['values']) if aq else None
         self.Fa_probs = np.asarray(aq['probs']) if aq else None
 
+        # Precomputed whitened means — built once here, not per scored
+        # sequence. This is the bulk of the cost of a Mahalanobis query.
+        self._maha = _MinMahalanobis(self.means, self.cholL,
+                                     normalize=self.normalize)
+        self._agg_maha = (
+            None if self.agg_means is None or self.agg_cholL is None
+            else _MinMahalanobis(self.agg_means, self.agg_cholL,
+                                 normalize=self.normalize))
+
     @classmethod
     def from_calibration(cls, model_dir, calib):
         """Build from a model dir + parsed calibration.json, or None if the
@@ -861,10 +918,45 @@ class ReliabilityScorer:
         """emb: (n, D) patch embeddings. agg_emb: (D_agg,) pooled embedding.
         host_probs: (n_host,) calibrated. Returns a dict with the raw distance,
         both patch OOD metrics, the aggregator typicality, and reliability."""
-        emb = np.asarray(emb, dtype=np.float64)
-        n = emb.shape[0]
-        d = _min_maha_np(emb, self.means, self.cholL,
-                         normalize=self.normalize)         # (n,)
+        d = self._maha.distances(emb)                             # (n,)
+        agg_d = (None if (self._agg_maha is None or agg_emb is None)
+                 else float(self._agg_maha.distances(agg_emb)[0]))
+        return self._fold(d, agg_d)
+
+    def score_batch(self, embs, host_probs=None, agg_embs=None):
+        """Batched variant of :meth:`score`.
+
+        ``embs`` is a sequence of (n_i, D) patch-embedding arrays and
+        ``agg_embs`` an optional sequence of (D_agg,) pooled embeddings.
+        Returns a list of result dicts in input order, identical to calling
+        :meth:`score` on each element — the patch distances for the whole
+        batch are computed in a single matmul rather than one per sequence.
+
+        ``host_probs`` is accepted and ignored, mirroring :meth:`score`
+        (host-probability features are no longer part of the folded model).
+        """
+        embs = list(embs)
+        if not embs:
+            return []
+        dists = self._maha.distances_split(embs)
+
+        agg_ds = [None] * len(embs)
+        if self._agg_maha is not None and agg_embs is not None:
+            agg_embs = list(agg_embs)
+            keep = [i for i, a in enumerate(agg_embs) if a is not None]
+            if keep:
+                stacked = np.stack([np.asarray(agg_embs[i]).reshape(-1)
+                                    for i in keep])
+                ad = self._agg_maha.distances(stacked)
+                for i, v in zip(keep, ad):
+                    agg_ds[i] = float(v)
+
+        return [self._fold(d, a) for d, a in zip(dists, agg_ds)]
+
+    def _fold(self, d, agg_distance=None):
+        """Fold per-patch distances (+ optional aggregator distance) into the
+        reliability dict. ``d`` is the (n,) array of min-genus distances."""
+        n = int(d.shape[0])
         raw = float(d.mean())
         q = _cdf_interp(d, self.Fp_values, self.Fp_probs)         # (n,)
         typicality = float(q.mean())
@@ -873,16 +965,15 @@ class ReliabilityScorer:
         sigma = float(_sigma_of_n(n, self.sm))
         z = (typicality - self.sm['mu0']) / max(sigma, 1e-9)
 
-        # aggregator-space distance + typicality (if model + embedding present)
-        agg_distance = float('nan')
+        # aggregator-space typicality (if a distance was supplied)
         agg_typicality = float('nan')
-        if self.agg_means is not None and agg_emb is not None:
-            ad = _min_maha_np(np.asarray(agg_emb, np.float64)[None, :],
-                              self.agg_means, self.agg_cholL,
-                              normalize=self.normalize)[0]
-            agg_distance = float(ad)
+        if agg_distance is None:
+            agg_distance = float('nan')
+        else:
+            agg_distance = float(agg_distance)
             if self.Fa_values is not None:
-                agg_typicality = float(_cdf_interp(ad, self.Fa_values,
+                agg_typicality = float(_cdf_interp(agg_distance,
+                                                   self.Fa_values,
                                                    self.Fa_probs))
 
         g = n / (n + self.n0) if self.n0 > 0 else 1.0

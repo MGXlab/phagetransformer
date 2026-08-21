@@ -45,6 +45,58 @@ import os
 import sys
 from typing import List, Optional
 
+
+# ---------------------------------------------------------------------------
+# Thread limiting — MUST run before numpy / torch are imported.
+#
+# OpenBLAS, MKL and OpenMP read their thread counts from the environment at
+# library load time, so setting them from inside main() has no effect. This
+# peeks at argv for --threads (falling back to $PT_NUM_THREADS) and sets the
+# environment before the numeric stack is pulled in. If something upstream
+# already imported numpy or torch, we re-exec once so the setting can take.
+# ---------------------------------------------------------------------------
+
+_THREAD_ENV_VARS = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+                    'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS',
+                    'VECLIB_MAXIMUM_THREADS')
+
+
+def _requested_threads() -> Optional[int]:
+    """--threads N / --threads=N from argv, else $PT_NUM_THREADS, else None."""
+    argv = sys.argv
+    raw = None
+    for i, a in enumerate(argv):
+        if a == '--threads' and i + 1 < len(argv):
+            raw = argv[i + 1]
+            break
+        if a.startswith('--threads='):
+            raw = a.split('=', 1)[1]
+            break
+    if raw is None:
+        raw = os.environ.get('PT_NUM_THREADS')
+    if raw is None:
+        return None
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _limit_threads_preimport() -> None:
+    n = _requested_threads()
+    if n is None:
+        return
+    for var in _THREAD_ENV_VARS:
+        os.environ[var] = str(n)
+    # Too late for this process? Re-exec once, now that the env is set.
+    if ('numpy' in sys.modules or 'torch' in sys.modules):
+        if os.environ.get('_PT_THREADS_REEXEC') != '1':
+            os.environ['_PT_THREADS_REEXEC'] = '1'
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_limit_threads_preimport()
+
 import numpy as np
 import torch
 from Bio import SeqIO
@@ -291,10 +343,20 @@ def predict_batch_full(model, tokenizer, seqs, patch_nt_len, stride,
 
     rels = [None] * B
     if scorer is not None:
-        pooled = pooled.to('cpu', torch.float32).numpy()
-        for i in range(B):
-            emb = per_seq[i].to('cpu', torch.float32).numpy()
-            rels[i] = scorer.score(emb, probs[i, :n_host], agg_emb=pooled[i])
+        # One device->host transfer for the whole batch rather than one per
+        # sequence, then a single batched Mahalanobis pass.
+        pooled_np = pooled.to('cpu', torch.float32).numpy()
+        if torch.is_tensor(per_seq):
+            # padded (B, max_n, D): trim each row to its real patch count
+            per_seq_np = per_seq.to('cpu', torch.float32).numpy()
+            embs = [per_seq_np[i, :all_counts[i]] for i in range(B)]
+        else:
+            embs = [per_seq[i].to('cpu', torch.float32).numpy()
+                    if torch.is_tensor(per_seq[i]) else np.asarray(per_seq[i])
+                    for i in range(B)]
+            embs = [e[:all_counts[i]] for i, e in enumerate(embs)]
+        rels = scorer.score_batch(embs, agg_embs=[pooled_np[i]
+                                                  for i in range(B)])
     return probs, rels
 
 
@@ -420,12 +482,31 @@ def main():
                         help='Max patches per sequence')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Sequences per batch (1 = sequential, saves memory)')
+    parser.add_argument('--threads', type=int, default=None,
+                        help='Cap CPU threads (BLAS/OpenMP and torch). '
+                             'Also settable via $PT_NUM_THREADS. Read before '
+                             'numpy/torch import; default is unrestricted.')
     parser.add_argument('--device', type=str, default='cuda')
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
+
+    # ---- thread limits ---------------------------------------------------
+    # BLAS/OpenMP were already capped before import (see _limit_threads_preimport);
+    # torch's own pools are runtime-settable and are capped here.
+    n_threads = args.threads if args.threads is not None else _requested_threads()
+    if n_threads is not None:
+        torch.set_num_threads(n_threads)
+        try:
+            torch.set_num_interop_threads(n_threads)
+        except RuntimeError:
+            pass  # already initialised; intra-op cap still applies
+    logger.info(
+        f"Threads: torch={torch.get_num_threads()} "
+        f"OMP={os.environ.get('OMP_NUM_THREADS', 'unset')} "
+        f"affinity={len(os.sched_getaffinity(0))}")
 
     # ---- load model ------------------------------------------------------
     device = torch.device(args.device if torch.cuda.is_available()
