@@ -17,10 +17,10 @@ conda activate phagetransformer
 python -m venv ptenv && source ptenv/bin/activate
 
 # Install the package
-pip install git+https://github.com/maltesie/phagetransformer.git
+pip install git+https://github.com/MGXlab/phagetransformer.git
 
 # Update the package (rerun the init command if new model files got released)
-pip install --upgrade git+https://github.com/maltesie/phagetransformer.git
+pip install --upgrade git+https://github.com/MGXlab/phagetransformer.git
 ```
 
 ### GPU support
