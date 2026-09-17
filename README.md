@@ -1,6 +1,6 @@
 # PhageTransformer
 
-A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences into trinucleotides across all six reading frames, using a codon-level tokenizer, a feature extraction CNN, cross-frame attention, and a multi-level transformer architecture to produce multi-label predictions for 1084 host genera.
+A hierarchical DNA classifier for predicting the bacterial hosts of bacteriophages from genomic sequences. PhageTransformer processes raw nucleotide sequences into trinucleotides across all six reading frames, using a codon-level tokenizer, a feature extraction CNN, cross-frame attention, and a multi-level transformer architecture to produce multi-label predictions for 1084 host genera. PhageTransformer can also identify bacterial sequences in metagenomic data.
 
 ## Installation
 
