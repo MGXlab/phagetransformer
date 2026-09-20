@@ -478,7 +478,7 @@ def main():
                              'to disable the marking.')
     parser.add_argument('--top_k', type=int, default=0,
                         help='Max predictions per sequence (0 = all above threshold)')
-    parser.add_argument('--max_patches', type=int, default=512,
+    parser.add_argument('--max_patches', type=int, default=80,
                         help='Max patches per sequence')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Sequences per batch (1 = sequential, saves memory)')
