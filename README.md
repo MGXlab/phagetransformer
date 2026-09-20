@@ -25,7 +25,7 @@ pip install --upgrade git+https://github.com/MGXlab/phagetransformer.git
 
 ### GPU support
 
-PhageTransformer uses PyTorch and will automatically use CUDA if available. For GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version. See [pytorch.org](https://pytorch.org/get-started/locally/) for installation instructions. Without a GPU, PhageTransformer will run on a CPU, but ~100x slower than on a GPU.
+PhageTransformer uses PyTorch and will automatically use CUDA if available. Installation of PyTorch and CUDA should work automatically for recent NVIDIA GPUs. For older GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version. See [pytorch.org](https://pytorch.org/get-started/locally/) for installation instructions. Without a GPU, PhageTransformer will run on a CPU, but ~100x slower than on a GPU.
 
 ## Quickstart
 
