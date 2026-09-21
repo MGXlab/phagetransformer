@@ -86,7 +86,7 @@ The output TSV contains one row per prediction (a sequence can have multiple hos
 | `above_host_threshold` | `yes` if host_score ≥ host threshold |
 | `reliability` | Reliability of the prediction based on OOD testing |
 | `above_reliability_threshold` | `yes` if reliability ≥ `min_reliability` |
-| `bacterial_score` | Score for the bacterial_fragment class (empty if model was trained without bacterial genomes) |
+| `bacterial_score` | Score for the bacterial_fragment class |
 | `above_bacterial_threshold` | `yes` if bacterial_score ≥ bacterial threshold |
 | `ood_distance`, `ood_typicality`, `ood_fraction` | Patch-level out-of-distribution diagnostics |
 | `ood_agg_distance`, `ood_agg_typicality` | Sequence-level (aggregator) out-of-distribution diagnostics |
@@ -113,7 +113,7 @@ If no prediction exceeds the threshold for a sequence, the single best predictio
 
 By default, predictions are thresholded at the FDR 10% level from `calibration.json` (`--fdr 0.1`). Use `--fdr 0.2` for a more permissive 20% FDR, or `--threshold 0.3` to set an exact score cutoff (overrides `--fdr`).
 
-The tiling stride used during prediction is read from `calibration.json` (saved during training) to ensure consistency between training evaluation and inference.
+The tiling stride used during prediction is read from `calibration.json` to ensure consistency between training evaluation and inference.
 
 ### train
 
@@ -133,7 +133,7 @@ data/
 └── test.csv
 ```
 
-**FASTA files** hold the phage nucleotide sequences. Each record's ID — the first whitespace-delimited token of the header line — is what matches it to a CSV row.
+**FASTA files** hold the phage nucleotide sequences. Each record's ID is what matches it to a CSV row.
 
 **CSV files** must contain exactly these two columns:
 
@@ -142,7 +142,7 @@ data/
 | `seq_id` | Matches a FASTA record ID in the same split |
 | `host_labels` | One or more host labels. Separate multiple hosts with `\|`. |
 
-Sequences and rows are matched by `seq_id`, not by file order, and only IDs present in both the FASTA and the CSV of a split are used. The set of host classes is built from `train.csv`; any label in `val.csv` or `test.csv` that does not appear in training is ignored — so all three files must use the **same label format**.
+Sequences and rows are matched by `seq_id`, not by file order, and only IDs present in both the FASTA and the CSV of a split are used. The set of host classes is built from `train.csv`; any label in `val.csv` or `test.csv` that does not appear in training is ignored, so all three files must use the **same label format**.
 
 Example `train.csv`:
 
